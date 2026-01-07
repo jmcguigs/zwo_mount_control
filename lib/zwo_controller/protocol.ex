@@ -330,6 +330,26 @@ defmodule ZwoController.Protocol do
   end
 
   # =============================================================================
+  # SETTER COMMANDS - Mount Mode
+  # =============================================================================
+
+  @doc """
+  Set mount to Alt-Az (azimuth/altitude) mode.
+
+  This command sets the mount to operate in Alt-Az mode for tracking.
+  Use this when the mount is physically installed on a tripod (no wedge).
+  """
+  def set_altaz_mode, do: ":AA#"
+
+  @doc """
+  Set mount to Polar (equatorial) mode.
+
+  This command sets the mount to operate in equatorial mode for tracking.
+  Use this when the mount is physically installed on an equatorial wedge.
+  """
+  def set_polar_mode, do: ":AP#"
+
+  # =============================================================================
   # RESPONSE PARSING
   # =============================================================================
 

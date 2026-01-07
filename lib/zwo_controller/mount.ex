@@ -273,6 +273,34 @@ defmodule ZwoController.Mount do
   end
 
   @doc """
+  Set mount to Alt-Az mode.
+
+  This configures the mount to operate in altitude-azimuth mode, suitable
+  when the mount is physically installed on a tripod without an equatorial wedge.
+
+  Note: This is a software configuration setting - the mount must be physically
+  installed in an appropriate orientation for Alt-Az operation to work correctly.
+  """
+  @spec set_altaz_mode(GenServer.server()) :: :ok | {:error, term()}
+  def set_altaz_mode(server) do
+    GenServer.call(server, :set_altaz_mode, @default_timeout)
+  end
+
+  @doc """
+  Set mount to Polar/Equatorial mode.
+
+  This configures the mount to operate in equatorial mode, suitable when
+  the mount is physically installed on an equatorial wedge and polar aligned.
+
+  Note: This is a software configuration setting - the mount must be physically
+  installed on a wedge for equatorial operation to work correctly.
+  """
+  @spec set_polar_mode(GenServer.server()) :: :ok | {:error, term()}
+  def set_polar_mode(server) do
+    GenServer.call(server, :set_polar_mode, @default_timeout)
+  end
+
+  @doc """
   Get mount information (model and version).
   """
   @spec get_info(GenServer.server()) :: {:ok, map()} | {:error, term()}
@@ -567,6 +595,22 @@ defmodule ZwoController.Mount do
   @impl true
   def handle_call({:set_buzzer, volume}, _from, state) do
     case send_and_receive(state, Protocol.set_buzzer_volume(volume)) do
+      {:ok, _} -> {:reply, :ok, state}
+      error -> {:reply, error, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:set_altaz_mode, _from, state) do
+    case send_and_receive(state, Protocol.set_altaz_mode()) do
+      {:ok, _} -> {:reply, :ok, state}
+      error -> {:reply, error, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:set_polar_mode, _from, state) do
+    case send_and_receive(state, Protocol.set_polar_mode()) do
       {:ok, _} -> {:reply, :ok, state}
       error -> {:reply, error, state}
     end

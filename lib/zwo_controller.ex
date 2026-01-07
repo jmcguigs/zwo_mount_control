@@ -292,6 +292,40 @@ defmodule ZwoController do
   @spec set_buzzer(GenServer.server(), 0..2) :: :ok | {:error, term()}
   defdelegate set_buzzer(mount, volume), to: Mount
 
+  @doc """
+  Set mount to Alt-Az (azimuth/altitude) mode.
+
+  Use this when the mount is physically installed on a tripod without an equatorial wedge.
+  In Alt-Az mode, the mount tracks by moving in azimuth and altitude coordinates.
+
+  **Important**: This is a software configuration. The mount hardware must be
+  physically configured correctly (no wedge) for Alt-Az tracking to work properly.
+
+  ## Examples
+
+      ZwoController.set_altaz_mode(mount)
+      :ok = ZwoController.wait_for_idle(mount)
+  """
+  @spec set_altaz_mode(GenServer.server()) :: :ok | {:error, term()}
+  defdelegate set_altaz_mode(mount), to: Mount
+
+  @doc """
+  Set mount to Polar/Equatorial mode.
+
+  Use this when the mount is physically installed on an equatorial wedge and properly
+  polar aligned. In equatorial mode, the mount tracks by rotating around the polar axis.
+
+  **Important**: This is a software configuration. The mount hardware must be
+  physically configured with an equatorial wedge for proper tracking.
+
+  ## Examples
+
+      ZwoController.set_polar_mode(mount)
+      :ok = ZwoController.wait_for_idle(mount)
+  """
+  @spec set_polar_mode(GenServer.server()) :: :ok | {:error, term()}
+  defdelegate set_polar_mode(mount), to: Mount
+
   # =============================================================================
   # UTILITIES
   # =============================================================================
@@ -322,6 +356,49 @@ defmodule ZwoController do
   """
   @spec status(GenServer.server()) :: {:ok, map()} | {:error, term()}
   defdelegate status(mount), to: Mount, as: :get_status
+
+  @doc """
+  Wait for the mount to finish slewing/homing operations.
+
+  Polls the mount status until `slewing: false`, with configurable timeout and interval.
+
+  ## Parameters
+    - `mount` - The mount server PID
+    - `timeout_ms` - Maximum time to wait in milliseconds (default: 60000 = 1 minute)
+    - `poll_interval_ms` - How often to check status (default: 500ms)
+
+  ## Examples
+
+      ZwoController.home(mount)
+      :ok = ZwoController.wait_for_idle(mount)
+      # Mount is now at home position and ready for next command
+
+      ZwoController.goto(mount, 12.5, 45.0)
+      :ok = ZwoController.wait_for_idle(mount, 120_000)  # Wait up to 2 minutes
+  """
+  @spec wait_for_idle(GenServer.server(), non_neg_integer(), non_neg_integer()) :: :ok | {:error, :timeout}
+  def wait_for_idle(mount, timeout_ms \\ 60_000, poll_interval_ms \\ 500) do
+    start_time = System.monotonic_time(:millisecond)
+    wait_for_idle_loop(mount, start_time, timeout_ms, poll_interval_ms)
+  end
+
+  defp wait_for_idle_loop(mount, start_time, timeout_ms, poll_interval_ms) do
+    elapsed = System.monotonic_time(:millisecond) - start_time
+
+    if elapsed >= timeout_ms do
+      {:error, :timeout}
+    else
+      case status(mount) do
+        {:ok, %{slewing: false}} ->
+          :ok
+        {:ok, %{slewing: true}} ->
+          Process.sleep(poll_interval_ms)
+          wait_for_idle_loop(mount, start_time, timeout_ms, poll_interval_ms)
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
 
   @doc """
   Send a raw command to the mount.
