@@ -41,7 +41,7 @@ defmodule ZwoController do
       dec = ZwoController.Coordinates.dms_to_dec(-23, 26, 21) # -23° 26' 21"
   """
 
-  alias ZwoController.{Mount, Mock, Coordinates, Discovery}
+  alias ZwoController.{Mount, Mock, Coordinates, Discovery, SatelliteTracker}
 
   # =============================================================================
   # STARTING THE MOUNT
@@ -381,4 +381,145 @@ defmodule ZwoController do
   """
   @spec dec(integer(), integer(), number()) :: float()
   defdelegate dec(degrees, minutes, seconds), to: Coordinates, as: :dms_to_dec
+
+  # =============================================================================
+  # SATELLITE TRACKING
+  # =============================================================================
+
+  @doc """
+  Create an observer location for satellite tracking.
+
+  ## Parameters
+    - `latitude` - Latitude in degrees (-90 to +90, positive North)
+    - `longitude` - Longitude in degrees (-180 to +180, positive East)
+    - `altitude_km` - Altitude above sea level in kilometers (default: 0)
+
+  ## Example
+
+      observer = ZwoController.observer(37.7749, -122.4194, 0.01)
+  """
+  @spec observer(float(), float(), float()) :: SpaceDust.State.GeodeticState.t()
+  def observer(latitude, longitude, altitude_km \\ 0.0) do
+    SatelliteTracker.observer(latitude, longitude, altitude_km)
+  end
+
+  @doc """
+  Start tracking a satellite by NORAD ID.
+
+  ## Options
+    - `:mount` - The mount process (required)
+    - `:norad_id` - NORAD catalog ID as string (required)
+    - `:observer` - Observer location from `observer/3` (required)
+    - `:update_interval_ms` - How often to update position (default: 500)
+    - `:min_elevation` - Minimum elevation to consider visible (default: 10°)
+    - `:name` - Optional GenServer name
+
+  ## Well-Known NORAD IDs
+
+      | Satellite              | NORAD ID |
+      |------------------------|----------|
+      | ISS                    | 25544    |
+      | Hubble Space Telescope | 20580    |
+      | GOES-16                | 41866    |
+
+  ## Example
+
+      observer = ZwoController.observer(37.7749, -122.4194, 0.01)
+      {:ok, mount} = ZwoController.start_mount(port: :auto)
+      {:ok, tracker} = ZwoController.track_satellite(
+        mount: mount,
+        norad_id: "25544",
+        observer: observer
+      )
+  """
+  @spec track_satellite(keyword()) :: GenServer.on_start()
+  defdelegate track_satellite(opts), to: SatelliteTracker, as: :start_link
+
+  @doc """
+  Fetch the latest TLE for a satellite from Celestrak.
+
+  ## Example
+
+      {:ok, tle} = ZwoController.fetch_tle("25544")
+      IO.puts("Tracking: \#{tle.objectName}")
+  """
+  @spec fetch_tle(String.t()) :: {:ok, map()} | {:error, term()}
+  defdelegate fetch_tle(norad_id), to: SatelliteTracker
+
+  @doc """
+  Get the current position of a tracked satellite.
+
+  ## Returns
+
+      {:ok, %{
+        az: 180.5,        # Azimuth in degrees
+        el: 45.2,         # Elevation in degrees
+        range_km: 500.0,  # Distance in kilometers
+        visible: true     # Above minimum elevation
+      }}
+  """
+  @spec satellite_position(GenServer.server()) :: {:ok, map()} | {:error, term()}
+  defdelegate satellite_position(tracker), to: SatelliteTracker, as: :current_position
+
+  @doc """
+  Start actively tracking a satellite with the mount.
+
+  The mount will continuously move to follow the satellite.
+  """
+  @spec start_satellite_tracking(GenServer.server()) :: :ok
+  defdelegate start_satellite_tracking(tracker), to: SatelliteTracker, as: :start_tracking
+
+  @doc """
+  Stop satellite tracking and halt mount motion.
+  """
+  @spec stop_satellite_tracking(GenServer.server()) :: :ok
+  defdelegate stop_satellite_tracking(tracker), to: SatelliteTracker, as: :stop_tracking
+
+  @doc """
+  Check if the tracked satellite is currently visible.
+  """
+  @spec satellite_visible?(GenServer.server()) :: boolean()
+  defdelegate satellite_visible?(tracker), to: SatelliteTracker, as: :visible?
+
+  @doc """
+  Get the next pass information for a tracked satellite.
+  """
+  @spec next_satellite_pass(GenServer.server()) :: {:ok, map()} | {:error, term()}
+  defdelegate next_satellite_pass(tracker), to: SatelliteTracker, as: :next_pass
+
+  @doc """
+  Compute satellite position at a specific time.
+
+  Useful for pass prediction without starting a tracker.
+
+  ## Example
+
+      observer = ZwoController.observer(37.7749, -122.4194, 0.01)
+      {:ok, tle} = ZwoController.fetch_tle("25544")
+      {:ok, pos} = ZwoController.satellite_position_at(tle, observer, DateTime.utc_now())
+  """
+  @spec satellite_position_at(map(), SpaceDust.State.GeodeticState.t(), DateTime.t()) ::
+    {:ok, map()} | {:error, term()}
+  defdelegate satellite_position_at(tle, observer, time), to: SatelliteTracker, as: :position_at
+
+  @doc """
+  Generate pass predictions for a satellite.
+
+  ## Options
+    - `:hours` - How many hours to predict (default: 24)
+    - `:step_seconds` - Time step for predictions (default: 30)
+    - `:min_elevation` - Minimum elevation to consider visible (default: 10°)
+
+  ## Example
+
+      observer = ZwoController.observer(37.7749, -122.4194, 0.01)
+      {:ok, tle} = ZwoController.fetch_tle("25544")
+      passes = ZwoController.predict_satellite_passes(tle, observer, hours: 12)
+
+      Enum.each(passes, fn pass ->
+        IO.puts("Pass at \#{pass.aos}: max el \#{pass.max_elevation}°")
+      end)
+  """
+  @spec predict_satellite_passes(map(), SpaceDust.State.GeodeticState.t(), keyword()) :: [map()]
+  defdelegate predict_satellite_passes(tle, observer, opts \\ []), to: SatelliteTracker, as: :predict_passes
 end

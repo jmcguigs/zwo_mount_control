@@ -22,7 +22,8 @@ defmodule ZwoController.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:circuits_uart, "~> 1.5"}
+      {:circuits_uart, "~> 1.5"},
+      {:space_dust, "~> 0.2.1"}
     ]
   end
 end
