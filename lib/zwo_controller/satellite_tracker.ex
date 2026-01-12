@@ -157,6 +157,64 @@ defmodule ZwoController.SatelliteTracker do
   end
 
   @doc """
+  Get the current tracker status.
+
+  Returns one of:
+  - `:idle` - Tracker created but not actively tracking
+  - `:slewing` - Performing initial GOTO to satellite position
+  - `:tracking` - Actively tracking satellite with pulse corrections
+
+  ## Example
+
+      {:ok, status} = ZwoController.SatelliteTracker.status(tracker)
+      # => :tracking
+  """
+  @spec status(GenServer.server()) :: {:ok, :idle | :slewing | :tracking}
+  def status(server) do
+    GenServer.call(server, :status)
+  end
+
+  @doc """
+  Wait for the tracker to reach the `:tracking` state.
+
+  Useful for waiting until the initial GOTO completes before taking
+  actions like capturing photos.
+
+  ## Options
+  - `timeout_ms` - Maximum time to wait (default: 60_000ms)
+  - `poll_interval_ms` - How often to check status (default: 500ms)
+
+  ## Example
+
+      :ok = ZwoController.start_satellite_tracking(tracker)
+      :ok = ZwoController.wait_for_tracking(tracker)
+      # Now safe to take photos
+  """
+  @spec wait_for_tracking(GenServer.server(), keyword()) :: :ok | {:error, :timeout}
+  def wait_for_tracking(server, opts \\ []) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, 60_000)
+    poll_interval = Keyword.get(opts, :poll_interval_ms, 500)
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+    wait_for_tracking_loop(server, deadline, poll_interval)
+  end
+
+  defp wait_for_tracking_loop(server, deadline, poll_interval) do
+    case status(server) do
+      {:ok, :tracking} ->
+        :ok
+
+      {:ok, _other} ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          {:error, :timeout}
+        else
+          Process.sleep(poll_interval)
+          wait_for_tracking_loop(server, deadline, poll_interval)
+        end
+    end
+  end
+
+  @doc """
   Check if the satellite is currently visible (above minimum elevation).
   """
   @spec visible?(GenServer.server()) :: boolean()
@@ -248,6 +306,9 @@ defmodule ZwoController.SatelliteTracker do
     update_interval = Keyword.get(opts, :update_interval_ms, @default_update_interval_ms)
     min_elevation = Keyword.get(opts, :min_elevation, @default_min_elevation)
 
+    # Trap exits so terminate/2 is called on crash
+    Process.flag(:trap_exit, true)
+
     # Fetch TLE immediately
     case fetch_tle(norad_id) do
       {:ok, tle} ->
@@ -261,8 +322,10 @@ defmodule ZwoController.SatelliteTracker do
           update_interval: update_interval,
           min_elevation: min_elevation,
           tracking: false,
+          status: :idle,
           timer_ref: nil,
-          last_position: nil
+          last_position: nil,
+          goto_target: nil
         }
 
         {:ok, state}
@@ -270,6 +333,19 @@ defmodule ZwoController.SatelliteTracker do
       {:error, reason} ->
         {:stop, {:tle_fetch_failed, reason}}
     end
+  end
+
+  @impl true
+  def terminate(reason, state) do
+    Logger.warning("SatelliteTracker terminating: #{inspect(reason)}")
+    # SAFETY: Always stop mount motion when tracker terminates
+    try do
+      ZwoController.stop(state.mount)
+      Logger.info("Mount motion stopped")
+    rescue
+      _ -> :ok
+    end
+    :ok
   end
 
   @impl true
@@ -299,16 +375,33 @@ defmodule ZwoController.SatelliteTracker do
   end
 
   @impl true
+  def handle_call(:status, _from, state) do
+    {:reply, {:ok, state.status}, state}
+  end
+
+  @impl true
   def handle_call(:start_tracking, _from, state) do
     Logger.info("Starting satellite tracking for NORAD #{state.norad_id}")
 
     # Cancel any existing timer
     if state.timer_ref, do: Process.cancel_timer(state.timer_ref)
 
-    # Start the tracking loop
-    timer_ref = schedule_update(state.update_interval)
+    # Compute initial position and defer GOTO to handle_continue
+    case compute_current_position(state) do
+      {:ok, pos} when pos.visible ->
+        # Return immediately, perform GOTO asynchronously via handle_continue
+        # Status is :slewing until GOTO completes
+        {:reply, :ok, %{state | tracking: true, status: :slewing, last_position: pos}, {:continue, {:initial_goto, pos}}}
 
-    {:reply, :ok, %{state | tracking: true, timer_ref: timer_ref}}
+      {:ok, pos} ->
+        Logger.warning("Satellite not visible (El=#{Float.round(pos.el, 1)}°), starting tracking anyway...")
+        timer_ref = schedule_update(state.update_interval)
+        {:reply, :ok, %{state | tracking: true, status: :tracking, timer_ref: timer_ref, last_position: pos}}
+
+      {:error, reason} ->
+        Logger.error("Failed to compute initial position: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
+    end
   end
 
   @impl true
@@ -321,7 +414,7 @@ defmodule ZwoController.SatelliteTracker do
     # Stop mount motion
     ZwoController.stop(state.mount)
 
-    {:reply, :ok, %{state | tracking: false, timer_ref: nil}}
+    {:reply, :ok, %{state | tracking: false, status: :idle, timer_ref: nil, goto_target: nil}}
   end
 
   @impl true
@@ -343,20 +436,95 @@ defmodule ZwoController.SatelliteTracker do
   end
 
   @impl true
+  def handle_continue({:initial_goto, pos}, state) do
+    Logger.info("Performing initial GOTO to satellite position: Az=#{Float.round(pos.az, 1)}° El=#{Float.round(pos.el, 1)}°")
+
+    # Set maximum slew rate for initial positioning
+    ZwoController.set_rate(state.mount, 9)
+    Process.sleep(100)
+
+    # Start non-blocking GOTO loop via handle_info
+    send(self(), {:goto_step, 1})
+    {:noreply, %{state | goto_target: pos}}
+  end
+
+  @impl true
+  def handle_info({:goto_step, iteration}, state) when state.status == :slewing do
+    # Convergence threshold in degrees
+    threshold = 1.0
+    # Maximum iterations to prevent infinite loops
+    max_iterations = 60
+    target = state.goto_target
+
+    {:ok, current} = ZwoController.altaz(state.mount)
+
+    # Normalize azimuth error to -180..+180 range
+    az_err = target.az - current.az
+    az_err = cond do
+      az_err > 180 -> az_err - 360
+      az_err < -180 -> az_err + 360
+      true -> az_err
+    end
+    el_err = target.el - current.alt
+
+    Logger.debug("[GOTO #{iteration}] Target: #{Float.round(target.az, 1)}°/#{Float.round(target.el, 1)}° | " <>
+                 "Current: #{Float.round(current.az, 1)}°/#{Float.round(current.alt, 1)}° | " <>
+                 "Err: #{Float.round(az_err, 2)}°/#{Float.round(el_err, 2)}°")
+
+    cond do
+      abs(az_err) < threshold and abs(el_err) < threshold ->
+        # GOTO complete - transition to tracking
+        {:ok, aligned_pos} = ZwoController.altaz(state.mount)
+        Logger.info("Initial alignment complete! Mount: Az=#{Float.round(aligned_pos.az, 1)}° Alt=#{Float.round(aligned_pos.alt, 1)}°")
+        Logger.info("Beginning pulse-based tracking...")
+        timer_ref = schedule_update(state.update_interval)
+        {:noreply, %{state | status: :tracking, timer_ref: timer_ref, goto_target: nil}}
+
+      iteration >= max_iterations ->
+        # Max iterations reached - transition to tracking anyway
+        Logger.warning("GOTO max iterations reached, starting tracking with current position")
+        timer_ref = schedule_update(state.update_interval)
+        {:noreply, %{state | status: :tracking, timer_ref: timer_ref, goto_target: nil}}
+
+      true ->
+        # Continue GOTO - move both axes and schedule next iteration
+        move_both_axes(state.mount, az_err, el_err, current.alt)
+        Process.send_after(self(), {:goto_step, iteration + 1}, 100)
+        {:noreply, state}
+    end
+  end
+
+  # Ignore stale goto steps if we're no longer slewing
+  @impl true
+  def handle_info({:goto_step, _iteration}, state) do
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info(:update_tracking, state) do
     state = if state.tracking do
       case compute_current_position(state) do
         {:ok, pos} ->
-          if pos.visible do
-            # Move mount to satellite position
-            move_to_position(state.mount, pos)
-          else
-            Logger.debug("Satellite below horizon (el=#{Float.round(pos.el, 1)}°), waiting...")
-          end
+          # Get current mount position for safety checks and error calculation
+          {:ok, mnt} = ZwoController.altaz(state.mount)
 
-          # Schedule next update
-          timer_ref = schedule_update(state.update_interval)
-          %{state | last_position: pos, timer_ref: timer_ref}
+          # SAFETY CHECK: Abort if mount goes too low
+          if mnt.alt < 0.0 do
+            Logger.error("SAFETY ABORT: Mount altitude #{Float.round(mnt.alt, 1)}° is below horizon!")
+            ZwoController.stop(state.mount)
+            %{state | tracking: false, timer_ref: nil}
+          else
+            if pos.visible do
+              # Move mount to satellite position using pulse-based tracking
+              move_to_position_with_pulses(state.mount, pos, mnt)
+            else
+              Logger.debug("Satellite below horizon (el=#{Float.round(pos.el, 1)}°), waiting...")
+            end
+
+            # Schedule next update
+            timer_ref = schedule_update(state.update_interval)
+            %{state | last_position: pos, timer_ref: timer_ref}
+          end
 
         {:error, reason} ->
           Logger.warning("Failed to compute position: #{inspect(reason)}")
@@ -396,42 +564,79 @@ defmodule ZwoController.SatelliteTracker do
     Observations.compute_az_el(observer, eci)
   end
 
-  defp move_to_position(mount, pos) do
-    # Get current mount position
-    case ZwoController.altaz(mount) do
-      {:ok, current} ->
-        az_error = pos.az - current.az
-        el_error = pos.el - current.alt
-
-        Logger.debug("Target: Az=#{Float.round(pos.az, 2)}° El=#{Float.round(pos.el, 2)}° | " <>
-                     "Error: Az=#{Float.round(az_error, 2)}° El=#{Float.round(el_error, 2)}°")
-
-        # Apply corrections using pulsed movement
-        # This is a simple proportional controller - could be improved with PID
-        apply_correction(mount, :azimuth, az_error)
-        apply_correction(mount, :elevation, el_error)
-
-      {:error, reason} ->
-        Logger.warning("Failed to get mount position: #{inspect(reason)}")
+  defp move_to_position_with_pulses(mount, sat_pos, current_pos) do
+    # Normalize azimuth error to -180..+180 range
+    az_err = sat_pos.az - current_pos.az
+    az_err = cond do
+      az_err > 180 -> az_err - 360
+      az_err < -180 -> az_err + 360
+      true -> az_err
     end
+    el_err = sat_pos.el - current_pos.alt
+
+    Logger.debug("Sat: #{Float.round(sat_pos.az, 1)}°/#{Float.round(sat_pos.el, 1)}° | " <>
+                 "Mnt: #{Float.round(current_pos.az, 1)}°/#{Float.round(current_pos.alt, 1)}° | " <>
+                 "Err: #{Float.round(az_err, 2)}°/#{Float.round(el_err, 2)}°")
+
+    # Move both axes simultaneously for efficiency
+    move_both_axes(mount, az_err, el_err, current_pos.alt)
   end
 
-  defp apply_correction(mount, axis, error) when abs(error) > 0.5 do
-    # Determine direction and pulse duration
-    {direction, pulse_ms} = case {axis, error > 0} do
-      {:azimuth, true} -> {:west, min(round(abs(error) * 50), 300)}
-      {:azimuth, false} -> {:east, min(round(abs(error) * 50), 300)}
-      {:elevation, true} -> {:north, min(round(abs(error) * 50), 300)}
-      {:elevation, false} -> {:south, min(round(abs(error) * 50), 300)}
+  # Move both azimuth and altitude axes simultaneously
+  defp move_both_axes(mount, az_err, el_err, current_alt) do
+    # Calculate pulse durations for each axis
+    az_pulse = if abs(az_err) > 0.3 do
+      max_pulse = if abs(az_err) > 10.0, do: 3000, else: 800
+      min(round(abs(az_err) * 100), max_pulse)
+    else
+      0
     end
 
-    # Apply pulse
-    ZwoController.move(mount, direction)
-    Process.sleep(pulse_ms)
-    ZwoController.stop_motion(mount, direction)
-  end
+    el_pulse = if abs(el_err) > 0.3 do
+      # SAFETY: prevent moving below horizon (pier collision)
+      if el_err < 0 and current_alt < 5.0 do
+        0
+      else
+        min(round(abs(el_err) * 100), 800)
+      end
+    else
+      0
+    end
 
-  defp apply_correction(_mount, _axis, _error), do: :ok
+    # Determine directions
+    az_dir = if az_err > 0, do: :east, else: :west
+    el_dir = if el_err > 0, do: :north, else: :south
+
+    # Start both axes moving simultaneously
+    if az_pulse > 0, do: ZwoController.move(mount, az_dir)
+    if el_pulse > 0, do: ZwoController.move(mount, el_dir)
+
+    # Wait for the longer pulse duration
+    max_pulse = max(az_pulse, el_pulse)
+
+    if max_pulse > 0 do
+      # Stop the shorter axis first if needed
+      if az_pulse > 0 and el_pulse > 0 and az_pulse != el_pulse do
+        shorter_pulse = min(az_pulse, el_pulse)
+        Process.sleep(shorter_pulse)
+
+        if az_pulse < el_pulse do
+          ZwoController.stop_motion(mount, az_dir)
+          Process.sleep(el_pulse - az_pulse)
+          ZwoController.stop_motion(mount, el_dir)
+        else
+          ZwoController.stop_motion(mount, el_dir)
+          Process.sleep(az_pulse - el_pulse)
+          ZwoController.stop_motion(mount, az_dir)
+        end
+      else
+        # Same duration or only one axis - simple case
+        Process.sleep(max_pulse)
+        if az_pulse > 0, do: ZwoController.stop_motion(mount, az_dir)
+        if el_pulse > 0, do: ZwoController.stop_motion(mount, el_dir)
+      end
+    end
+  end
 
   defp schedule_update(interval) do
     Process.send_after(self(), :update_tracking, interval)

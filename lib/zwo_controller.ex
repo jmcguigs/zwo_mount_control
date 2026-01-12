@@ -594,6 +594,41 @@ defmodule ZwoController do
   defdelegate stop_satellite_tracking(tracker), to: SatelliteTracker, as: :stop_tracking
 
   @doc """
+  Get the current satellite tracker status.
+
+  Returns one of:
+  - `:idle` - Tracker created but not actively tracking
+  - `:slewing` - Performing initial GOTO to satellite position
+  - `:tracking` - Actively tracking satellite with pulse corrections
+
+  ## Example
+
+      {:ok, status} = ZwoController.satellite_tracker_status(tracker)
+      # => :tracking
+  """
+  @spec satellite_tracker_status(GenServer.server()) :: {:ok, :idle | :slewing | :tracking}
+  defdelegate satellite_tracker_status(tracker), to: SatelliteTracker, as: :status
+
+  @doc """
+  Wait for the satellite tracker to reach the `:tracking` state.
+
+  Useful for waiting until the initial GOTO completes before taking
+  actions like capturing photos.
+
+  ## Options
+  - `timeout_ms` - Maximum time to wait (default: 60_000ms)
+  - `poll_interval_ms` - How often to check status (default: 500ms)
+
+  ## Example
+
+      :ok = ZwoController.start_satellite_tracking(tracker)
+      :ok = ZwoController.wait_for_satellite_tracking(tracker)
+      # Now safe to take photos
+  """
+  @spec wait_for_satellite_tracking(GenServer.server(), keyword()) :: :ok | {:error, :timeout}
+  defdelegate wait_for_satellite_tracking(tracker, opts \\ []), to: SatelliteTracker, as: :wait_for_tracking
+
+  @doc """
   Check if the tracked satellite is currently visible.
   """
   @spec satellite_visible?(GenServer.server()) :: boolean()
