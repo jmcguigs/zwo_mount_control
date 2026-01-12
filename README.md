@@ -18,7 +18,17 @@ Add `zwo_controller` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:zwo_controller, path: "path/to/zwo_controller"}
+    {:zwo_controller, "~> 0.1.0"}
+  ]
+end
+```
+
+Or for the latest development version from GitHub:
+
+```elixir
+def deps do
+  [
+    {:zwo_controller, github: "jmcguigs/zwo_controller"}
   ]
 end
 ```
