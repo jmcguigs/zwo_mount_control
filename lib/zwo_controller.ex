@@ -31,9 +31,33 @@ defmodule ZwoController do
 
   ## Coordinate Systems
 
-  All coordinates use:
+  The mount supports two coordinate systems depending on its mode:
+
+  ### Equatorial Coordinates (RA/Dec)
   - **Right Ascension (RA)**: Decimal hours (0-24)
   - **Declination (DEC)**: Decimal degrees (-90 to +90)
+
+  Used when mount is in equatorial mode (on wedge, polar aligned).
+
+  ### Horizontal Coordinates (Az/Alt)
+  - **Azimuth (Az)**: Degrees from North (0-360°, clockwise)
+  - **Altitude (Alt)**: Degrees above horizon (0-90°)
+
+  Used when mount is in Alt-Az mode (on tripod, no wedge).
+
+  ## Mount Modes
+
+  The mount must be set to the correct mode for your physical configuration:
+
+      # Alt-Az mode - for satellite tracking or when mount is on tripod
+      ZwoController.set_altaz_mode(mount)
+      {:ok, pos} = ZwoController.altaz(mount)  # Get Az/Alt coordinates
+
+      # Equatorial mode - for celestial tracking when mount is on wedge
+      ZwoController.set_polar_mode(mount)
+      {:ok, pos} = ZwoController.position(mount)  # Get RA/Dec coordinates
+
+  ## Coordinate Conversion
 
   To convert from HMS/DMS, use `ZwoController.Coordinates`:
 
@@ -41,7 +65,7 @@ defmodule ZwoController do
       dec = ZwoController.Coordinates.dms_to_dec(-23, 26, 21) # -23° 26' 21"
   """
 
-  alias ZwoController.{Mount, Mock, Coordinates, Discovery}
+  alias ZwoController.{Mount, Mock, Coordinates, Discovery, SatelliteTracker}
 
   # =============================================================================
   # STARTING THE MOUNT
@@ -292,6 +316,57 @@ defmodule ZwoController do
   @spec set_buzzer(GenServer.server(), 0..2) :: :ok | {:error, term()}
   defdelegate set_buzzer(mount, volume), to: Mount
 
+  @doc """
+  Set mount to Alt-Az (azimuth/altitude) mode.
+
+  Use this when the mount is physically installed on a tripod without an equatorial wedge.
+  In Alt-Az mode, the mount tracks by moving in azimuth and altitude coordinates.
+
+  **Important**: This is a software configuration. The mount hardware must be
+  physically configured correctly (no wedge) for Alt-Az tracking to work properly.
+
+  **Note**: The mount firmware doesn't send a response to this command, so it may
+  return `{:error, :timeout}`. Check the mount status afterward to verify the mode change.
+
+  ## Examples
+
+      case ZwoController.set_altaz_mode(mount) do
+        :ok -> :ok
+        {:error, :timeout} -> :ok  # Expected - command doesn't respond
+      end
+      Process.sleep(1000)
+      {:ok, status} = ZwoController.status(mount)
+      # status.mount_type should be :altaz
+      :ok = ZwoController.wait_for_idle(mount)
+  """
+  @spec set_altaz_mode(GenServer.server()) :: :ok | {:error, term()}
+  defdelegate set_altaz_mode(mount), to: Mount
+
+  @doc """
+  Set mount to Polar/Equatorial mode.
+
+  Use this when the mount is physically installed on an equatorial wedge and properly
+  polar aligned. In equatorial mode, the mount tracks by rotating around the polar axis.
+
+  **Important**: This is a software configuration. The mount hardware must be
+  physically configured with an equatorial wedge for proper tracking.
+
+  **Note**: The mount firmware doesn't send a response to this command, so it may
+  return `{:error, :timeout}`. Check the mount status afterward to verify the mode change.
+
+  ## Examples
+
+      case ZwoController.set_polar_mode(mount) do
+        :ok -> :ok
+        {:error, :timeout} -> :ok  # Expected - command doesn't respond
+      end
+      Process.sleep(1000)
+      {:ok, status} = ZwoController.status(mount)
+      # status.mount_type should be :equatorial
+  """
+  @spec set_polar_mode(GenServer.server()) :: :ok | {:error, term()}
+  defdelegate set_polar_mode(mount), to: Mount
+
   # =============================================================================
   # UTILITIES
   # =============================================================================
@@ -322,6 +397,49 @@ defmodule ZwoController do
   """
   @spec status(GenServer.server()) :: {:ok, map()} | {:error, term()}
   defdelegate status(mount), to: Mount, as: :get_status
+
+  @doc """
+  Wait for the mount to finish slewing/homing operations.
+
+  Polls the mount status until `slewing: false`, with configurable timeout and interval.
+
+  ## Parameters
+    - `mount` - The mount server PID
+    - `timeout_ms` - Maximum time to wait in milliseconds (default: 60000 = 1 minute)
+    - `poll_interval_ms` - How often to check status (default: 500ms)
+
+  ## Examples
+
+      ZwoController.home(mount)
+      :ok = ZwoController.wait_for_idle(mount)
+      # Mount is now at home position and ready for next command
+
+      ZwoController.goto(mount, 12.5, 45.0)
+      :ok = ZwoController.wait_for_idle(mount, 120_000)  # Wait up to 2 minutes
+  """
+  @spec wait_for_idle(GenServer.server(), non_neg_integer(), non_neg_integer()) :: :ok | {:error, :timeout}
+  def wait_for_idle(mount, timeout_ms \\ 60_000, poll_interval_ms \\ 500) do
+    start_time = System.monotonic_time(:millisecond)
+    wait_for_idle_loop(mount, start_time, timeout_ms, poll_interval_ms)
+  end
+
+  defp wait_for_idle_loop(mount, start_time, timeout_ms, poll_interval_ms) do
+    elapsed = System.monotonic_time(:millisecond) - start_time
+
+    if elapsed >= timeout_ms do
+      {:error, :timeout}
+    else
+      case status(mount) do
+        {:ok, %{slewing: false}} ->
+          :ok
+        {:ok, %{slewing: true}} ->
+          Process.sleep(poll_interval_ms)
+          wait_for_idle_loop(mount, start_time, timeout_ms, poll_interval_ms)
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
 
   @doc """
   Send a raw command to the mount.
@@ -381,4 +499,145 @@ defmodule ZwoController do
   """
   @spec dec(integer(), integer(), number()) :: float()
   defdelegate dec(degrees, minutes, seconds), to: Coordinates, as: :dms_to_dec
+
+  # =============================================================================
+  # SATELLITE TRACKING
+  # =============================================================================
+
+  @doc """
+  Create an observer location for satellite tracking.
+
+  ## Parameters
+    - `latitude` - Latitude in degrees (-90 to +90, positive North)
+    - `longitude` - Longitude in degrees (-180 to +180, positive East)
+    - `altitude_km` - Altitude above sea level in kilometers (default: 0)
+
+  ## Example
+
+      observer = ZwoController.observer(37.7749, -122.4194, 0.01)
+  """
+  @spec observer(float(), float(), float()) :: SpaceDust.State.GeodeticState.t()
+  def observer(latitude, longitude, altitude_km \\ 0.0) do
+    SatelliteTracker.observer(latitude, longitude, altitude_km)
+  end
+
+  @doc """
+  Start tracking a satellite by NORAD ID.
+
+  ## Options
+    - `:mount` - The mount process (required)
+    - `:norad_id` - NORAD catalog ID as string (required)
+    - `:observer` - Observer location from `observer/3` (required)
+    - `:update_interval_ms` - How often to update position (default: 500)
+    - `:min_elevation` - Minimum elevation to consider visible (default: 10°)
+    - `:name` - Optional GenServer name
+
+  ## Well-Known NORAD IDs
+
+      | Satellite              | NORAD ID |
+      |------------------------|----------|
+      | ISS                    | 25544    |
+      | Hubble Space Telescope | 20580    |
+      | GOES-16                | 41866    |
+
+  ## Example
+
+      observer = ZwoController.observer(37.7749, -122.4194, 0.01)
+      {:ok, mount} = ZwoController.start_mount(port: :auto)
+      {:ok, tracker} = ZwoController.track_satellite(
+        mount: mount,
+        norad_id: "25544",
+        observer: observer
+      )
+  """
+  @spec track_satellite(keyword()) :: GenServer.on_start()
+  defdelegate track_satellite(opts), to: SatelliteTracker, as: :start_link
+
+  @doc """
+  Fetch the latest TLE for a satellite from Celestrak.
+
+  ## Example
+
+      {:ok, tle} = ZwoController.fetch_tle("25544")
+      IO.puts("Tracking: \#{tle.objectName}")
+  """
+  @spec fetch_tle(String.t()) :: {:ok, map()} | {:error, term()}
+  defdelegate fetch_tle(norad_id), to: SatelliteTracker
+
+  @doc """
+  Get the current position of a tracked satellite.
+
+  ## Returns
+
+      {:ok, %{
+        az: 180.5,        # Azimuth in degrees
+        el: 45.2,         # Elevation in degrees
+        range_km: 500.0,  # Distance in kilometers
+        visible: true     # Above minimum elevation
+      }}
+  """
+  @spec satellite_position(GenServer.server()) :: {:ok, map()} | {:error, term()}
+  defdelegate satellite_position(tracker), to: SatelliteTracker, as: :current_position
+
+  @doc """
+  Start actively tracking a satellite with the mount.
+
+  The mount will continuously move to follow the satellite.
+  """
+  @spec start_satellite_tracking(GenServer.server()) :: :ok
+  defdelegate start_satellite_tracking(tracker), to: SatelliteTracker, as: :start_tracking
+
+  @doc """
+  Stop satellite tracking and halt mount motion.
+  """
+  @spec stop_satellite_tracking(GenServer.server()) :: :ok
+  defdelegate stop_satellite_tracking(tracker), to: SatelliteTracker, as: :stop_tracking
+
+  @doc """
+  Check if the tracked satellite is currently visible.
+  """
+  @spec satellite_visible?(GenServer.server()) :: boolean()
+  defdelegate satellite_visible?(tracker), to: SatelliteTracker, as: :visible?
+
+  @doc """
+  Get the next pass information for a tracked satellite.
+  """
+  @spec next_satellite_pass(GenServer.server()) :: {:ok, map()} | {:error, term()}
+  defdelegate next_satellite_pass(tracker), to: SatelliteTracker, as: :next_pass
+
+  @doc """
+  Compute satellite position at a specific time.
+
+  Useful for pass prediction without starting a tracker.
+
+  ## Example
+
+      observer = ZwoController.observer(37.7749, -122.4194, 0.01)
+      {:ok, tle} = ZwoController.fetch_tle("25544")
+      {:ok, pos} = ZwoController.satellite_position_at(tle, observer, DateTime.utc_now())
+  """
+  @spec satellite_position_at(map(), SpaceDust.State.GeodeticState.t(), DateTime.t()) ::
+    {:ok, map()} | {:error, term()}
+  defdelegate satellite_position_at(tle, observer, time), to: SatelliteTracker, as: :position_at
+
+  @doc """
+  Generate pass predictions for a satellite.
+
+  ## Options
+    - `:hours` - How many hours to predict (default: 24)
+    - `:step_seconds` - Time step for predictions (default: 30)
+    - `:min_elevation` - Minimum elevation to consider visible (default: 10°)
+
+  ## Example
+
+      observer = ZwoController.observer(37.7749, -122.4194, 0.01)
+      {:ok, tle} = ZwoController.fetch_tle("25544")
+      passes = ZwoController.predict_satellite_passes(tle, observer, hours: 12)
+
+      Enum.each(passes, fn pass ->
+        IO.puts("Pass at \#{pass.aos}: max el \#{pass.max_elevation}°")
+      end)
+  """
+  @spec predict_satellite_passes(map(), SpaceDust.State.GeodeticState.t(), keyword()) :: [map()]
+  defdelegate predict_satellite_passes(tle, observer, opts \\ []), to: SatelliteTracker, as: :predict_passes
 end
