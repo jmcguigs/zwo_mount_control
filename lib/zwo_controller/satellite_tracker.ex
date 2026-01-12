@@ -51,6 +51,14 @@ defmodule ZwoController.SatelliteTracker do
   @default_update_interval_ms 500
   @default_min_elevation 10.0  # degrees
 
+  # PID tuning constants (tuned for pulse-based control)
+  # Output is pulse duration in milliseconds
+  @pid_kp 80.0          # Proportional gain: ms per degree error
+  @pid_ki 15.0          # Integral gain: ms per degree*second
+  @pid_kd 20.0          # Derivative gain: ms per degree/second
+  @pid_max_integral 5.0 # Anti-windup: max accumulated integral in degrees*seconds
+  @pid_deadband 0.05    # Ignore errors smaller than this (degrees)
+
   # =============================================================================
   # PUBLIC API
   # =============================================================================
@@ -325,7 +333,15 @@ defmodule ZwoController.SatelliteTracker do
           status: :idle,
           timer_ref: nil,
           last_position: nil,
-          goto_target: nil
+          goto_target: nil,
+          # PID controller state
+          pid: %{
+            az_integral: 0.0,
+            el_integral: 0.0,
+            az_last_error: 0.0,
+            el_last_error: 0.0,
+            last_time: nil
+          }
         }
 
         {:ok, state}
@@ -414,7 +430,10 @@ defmodule ZwoController.SatelliteTracker do
     # Stop mount motion
     ZwoController.stop(state.mount)
 
-    {:reply, :ok, %{state | tracking: false, status: :idle, timer_ref: nil, goto_target: nil}}
+    # Reset PID state
+    pid = %{az_integral: 0.0, el_integral: 0.0, az_last_error: 0.0, el_last_error: 0.0, last_time: nil}
+
+    {:reply, :ok, %{state | tracking: false, status: :idle, timer_ref: nil, goto_target: nil, pid: pid}}
   end
 
   @impl true
@@ -512,13 +531,16 @@ defmodule ZwoController.SatelliteTracker do
           if mnt.alt < 0.0 do
             Logger.error("SAFETY ABORT: Mount altitude #{Float.round(mnt.alt, 1)}° is below horizon!")
             ZwoController.stop(state.mount)
-            %{state | tracking: false, timer_ref: nil}
+            %{state | tracking: false, status: :idle, timer_ref: nil}
           else
-            if pos.visible do
-              # Move mount to satellite position using pulse-based tracking
-              move_to_position_with_pulses(state.mount, pos, mnt)
+            state = if pos.visible do
+              # Use PID controller for tracking
+              {new_pid, az_pulse, el_pulse} = compute_pid_output(state.pid, pos, mnt)
+              apply_pid_pulses(state.mount, az_pulse, el_pulse, mnt.alt)
+              %{state | pid: new_pid}
             else
               Logger.debug("Satellite below horizon (el=#{Float.round(pos.el, 1)}°), waiting...")
+              state
             end
 
             # Schedule next update
@@ -564,25 +586,130 @@ defmodule ZwoController.SatelliteTracker do
     Observations.compute_az_el(observer, eci)
   end
 
-  defp move_to_position_with_pulses(mount, sat_pos, current_pos) do
+  # Compute PID output for both axes
+  defp compute_pid_output(pid, sat_pos, mnt_pos) do
+    now = System.monotonic_time(:millisecond)
+
     # Normalize azimuth error to -180..+180 range
-    az_err = sat_pos.az - current_pos.az
+    az_err = sat_pos.az - mnt_pos.az
     az_err = cond do
       az_err > 180 -> az_err - 360
       az_err < -180 -> az_err + 360
       true -> az_err
     end
-    el_err = sat_pos.el - current_pos.alt
+    el_err = sat_pos.el - mnt_pos.alt
 
-    Logger.debug("Sat: #{Float.round(sat_pos.az, 1)}°/#{Float.round(sat_pos.el, 1)}° | " <>
-                 "Mnt: #{Float.round(current_pos.az, 1)}°/#{Float.round(current_pos.alt, 1)}° | " <>
-                 "Err: #{Float.round(az_err, 2)}°/#{Float.round(el_err, 2)}°")
+    # Calculate dt in seconds
+    dt = case pid.last_time do
+      nil -> 0.5  # Default to update interval on first iteration
+      last -> (now - last) / 1000.0
+    end
 
-    # Move both axes simultaneously for efficiency
-    move_both_axes(mount, az_err, el_err, current_pos.alt)
+    # PID calculation for azimuth
+    {az_pulse, az_integral, az_last_error} = pid_axis(
+      az_err, pid.az_integral, pid.az_last_error, dt
+    )
+
+    # PID calculation for elevation
+    {el_pulse, el_integral, el_last_error} = pid_axis(
+      el_err, pid.el_integral, pid.el_last_error, dt
+    )
+
+    new_pid = %{
+      az_integral: az_integral,
+      el_integral: el_integral,
+      az_last_error: az_last_error,
+      el_last_error: el_last_error,
+      last_time: now
+    }
+
+    Logger.debug("PID: Az err=#{Float.round(az_err, 3)}° pulse=#{round(az_pulse)}ms | " <>
+                 "El err=#{Float.round(el_err, 3)}° pulse=#{round(el_pulse)}ms | " <>
+                 "I_az=#{Float.round(az_integral, 2)} I_el=#{Float.round(el_integral, 2)}")
+
+    {new_pid, az_pulse, el_pulse}
   end
 
-  # Move both azimuth and altitude axes simultaneously
+  # Single axis PID calculation
+  defp pid_axis(error, integral, last_error, dt) do
+    # Apply deadband - ignore very small errors
+    if abs(error) < @pid_deadband do
+      # Within deadband, decay integral slowly
+      new_integral = integral * 0.9
+      {0.0, new_integral, error}
+    else
+      # Proportional term
+      p_term = @pid_kp * error
+
+      # Integral term with anti-windup
+      new_integral = integral + (error * dt)
+      new_integral = max(-@pid_max_integral, min(@pid_max_integral, new_integral))
+      i_term = @pid_ki * new_integral
+
+      # Derivative term (on error, not measurement, for simplicity)
+      derivative = if dt > 0, do: (error - last_error) / dt, else: 0.0
+      d_term = @pid_kd * derivative
+
+      # Combined output (pulse duration in ms)
+      output = p_term + i_term + d_term
+
+      # Clamp output to reasonable pulse range
+      output = max(-3000.0, min(3000.0, output))
+
+      {output, new_integral, error}
+    end
+  end
+
+  # Apply PID-computed pulses to both axes
+  defp apply_pid_pulses(mount, az_pulse, el_pulse, current_alt) do
+    # Convert signed pulse to direction + absolute duration
+    # Minimum pulse threshold to avoid tiny ineffective movements
+    min_pulse = 30
+
+    az_pulse_abs = abs(round(az_pulse))
+    el_pulse_abs = abs(round(el_pulse))
+
+    # Safety: don't move down if altitude is low
+    el_pulse_abs = if el_pulse < 0 and current_alt < 5.0, do: 0, else: el_pulse_abs
+
+    # Apply minimum threshold
+    az_pulse_final = if az_pulse_abs >= min_pulse, do: az_pulse_abs, else: 0
+    el_pulse_final = if el_pulse_abs >= min_pulse, do: el_pulse_abs, else: 0
+
+    # Determine directions
+    az_dir = if az_pulse > 0, do: :east, else: :west
+    el_dir = if el_pulse > 0, do: :north, else: :south
+
+    # Start both axes moving simultaneously
+    if az_pulse_final > 0, do: ZwoController.move(mount, az_dir)
+    if el_pulse_final > 0, do: ZwoController.move(mount, el_dir)
+
+    # Wait for the longer pulse duration
+    max_pulse = max(az_pulse_final, el_pulse_final)
+
+    if max_pulse > 0 do
+      if az_pulse_final > 0 and el_pulse_final > 0 and az_pulse_final != el_pulse_final do
+        shorter_pulse = min(az_pulse_final, el_pulse_final)
+        Process.sleep(shorter_pulse)
+
+        if az_pulse_final < el_pulse_final do
+          ZwoController.stop_motion(mount, az_dir)
+          Process.sleep(el_pulse_final - az_pulse_final)
+          ZwoController.stop_motion(mount, el_dir)
+        else
+          ZwoController.stop_motion(mount, el_dir)
+          Process.sleep(az_pulse_final - el_pulse_final)
+          ZwoController.stop_motion(mount, az_dir)
+        end
+      else
+        Process.sleep(max_pulse)
+        if az_pulse_final > 0, do: ZwoController.stop_motion(mount, az_dir)
+        if el_pulse_final > 0, do: ZwoController.stop_motion(mount, el_dir)
+      end
+    end
+  end
+
+  # Move both azimuth and altitude axes simultaneously (simple P control for GOTO)
   defp move_both_axes(mount, az_err, el_err, current_alt) do
     # Calculate pulse durations for each axis
     az_pulse = if abs(az_err) > 0.3 do

@@ -2,8 +2,8 @@
 # This script demonstrates tracking a GPS satellite with proper homing and safety limits
 
 # Configuration
-norad_id = "19945"
-min_altitude = 10.0  # Don't track below 10° elevation
+norad_id = "54132"
+min_altitude = 5.0  # Don't track below 10° elevation
 latitude = 39.7392
 longitude = -104.9903
 altitude_km = 1.6
