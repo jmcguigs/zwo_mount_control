@@ -31,9 +31,33 @@ defmodule ZwoController do
 
   ## Coordinate Systems
 
-  All coordinates use:
+  The mount supports two coordinate systems depending on its mode:
+
+  ### Equatorial Coordinates (RA/Dec)
   - **Right Ascension (RA)**: Decimal hours (0-24)
   - **Declination (DEC)**: Decimal degrees (-90 to +90)
+
+  Used when mount is in equatorial mode (on wedge, polar aligned).
+
+  ### Horizontal Coordinates (Az/Alt)
+  - **Azimuth (Az)**: Degrees from North (0-360°, clockwise)
+  - **Altitude (Alt)**: Degrees above horizon (0-90°)
+
+  Used when mount is in Alt-Az mode (on tripod, no wedge).
+
+  ## Mount Modes
+
+  The mount must be set to the correct mode for your physical configuration:
+
+      # Alt-Az mode - for satellite tracking or when mount is on tripod
+      ZwoController.set_altaz_mode(mount)
+      {:ok, pos} = ZwoController.altaz(mount)  # Get Az/Alt coordinates
+
+      # Equatorial mode - for celestial tracking when mount is on wedge
+      ZwoController.set_polar_mode(mount)
+      {:ok, pos} = ZwoController.position(mount)  # Get RA/Dec coordinates
+
+  ## Coordinate Conversion
 
   To convert from HMS/DMS, use `ZwoController.Coordinates`:
 
@@ -301,9 +325,18 @@ defmodule ZwoController do
   **Important**: This is a software configuration. The mount hardware must be
   physically configured correctly (no wedge) for Alt-Az tracking to work properly.
 
+  **Note**: The mount firmware doesn't send a response to this command, so it may
+  return `{:error, :timeout}`. Check the mount status afterward to verify the mode change.
+
   ## Examples
 
-      ZwoController.set_altaz_mode(mount)
+      case ZwoController.set_altaz_mode(mount) do
+        :ok -> :ok
+        {:error, :timeout} -> :ok  # Expected - command doesn't respond
+      end
+      Process.sleep(1000)
+      {:ok, status} = ZwoController.status(mount)
+      # status.mount_type should be :altaz
       :ok = ZwoController.wait_for_idle(mount)
   """
   @spec set_altaz_mode(GenServer.server()) :: :ok | {:error, term()}
@@ -318,10 +351,18 @@ defmodule ZwoController do
   **Important**: This is a software configuration. The mount hardware must be
   physically configured with an equatorial wedge for proper tracking.
 
+  **Note**: The mount firmware doesn't send a response to this command, so it may
+  return `{:error, :timeout}`. Check the mount status afterward to verify the mode change.
+
   ## Examples
 
-      ZwoController.set_polar_mode(mount)
-      :ok = ZwoController.wait_for_idle(mount)
+      case ZwoController.set_polar_mode(mount) do
+        :ok -> :ok
+        {:error, :timeout} -> :ok  # Expected - command doesn't respond
+      end
+      Process.sleep(1000)
+      {:ok, status} = ZwoController.status(mount)
+      # status.mount_type should be :equatorial
   """
   @spec set_polar_mode(GenServer.server()) :: :ok | {:error, term()}
   defdelegate set_polar_mode(mount), to: Mount

@@ -7,6 +7,7 @@ An Elixir library for controlling ZWO AM5 telescope mounts via serial communicat
 - **GoTo/Slewing**: Command the mount to slew to any celestial coordinates
 - **Manual Motion**: Control axis motion at various speeds (guide to max slew)
 - **Tracking**: Enable/disable tracking with sidereal, lunar, or solar rates
+- **Alt-Az & Equatorial Modes**: Switch between altitude-azimuth and equatorial tracking
 - **Autoguiding**: Send guide pulses for autoguiding applications
 - **Mock Mount**: Test your application without physical hardware
 
@@ -92,6 +93,36 @@ ZwoController.track(mount, :solar)     # For the Sun
 ZwoController.track_off(mount)         # Disable tracking
 ```
 
+### Mount Mode (Alt-Az vs Equatorial)
+
+The ZWO AM5 can operate in two modes depending on physical installation:
+
+```elixir
+# Alt-Az mode - for mount on tripod (no wedge)
+# Use for azimuth/altitude tracking (satellites, terrestrial objects)
+ZwoController.set_altaz_mode(mount)
+
+# Equatorial mode - for mount on wedge (polar aligned)
+# Use for tracking celestial objects that move with Earth's rotation
+ZwoController.set_polar_mode(mount)
+
+# Check current mount type
+{:ok, status} = ZwoController.status(mount)
+IO.inspect(status.mount_type)  # => :altaz or :equatorial
+```
+
+**Important:** The mount mode must match your physical setup:
+- **Alt-Az mode**: Mount on tripod, no wedge. Tracks by moving in azimuth and altitude.
+- **Equatorial mode**: Mount on equatorial wedge, polar aligned. Tracks by rotating around polar axis.
+
+For satellite tracking or azimuth/altitude control, you **must** set Alt-Az mode first:
+
+```elixir
+ZwoController.set_altaz_mode(mount)
+Process.sleep(1000)  # Wait for mode change
+{:ok, pos} = ZwoController.altaz(mount)  # Now returns Az/Alt coordinates
+```
+
 ### Home and Park
 
 ```elixir
@@ -101,9 +132,33 @@ ZwoController.park(mount)  # Go to park position
 
 ## Coordinate System
 
-All coordinates use:
+The mount supports two coordinate systems depending on its mode:
+
+### Equatorial Coordinates (RA/Dec)
+
+Used when mount is in equatorial mode (on wedge, polar aligned):
+
 - **Right Ascension (RA)**: Decimal hours (0-24)
 - **Declination (DEC)**: Decimal degrees (-90 to +90)
+
+```elixir
+# Get current RA/Dec position
+{:ok, pos} = ZwoController.position(mount)
+IO.puts("RA: #{pos.ra}h, DEC: #{pos.dec}°")
+```
+
+### Horizontal Coordinates (Az/Alt)
+
+Used when mount is in Alt-Az mode (on tripod, no wedge):
+
+- **Azimuth (Az)**: Degrees from North (0-360°, clockwise)
+- **Altitude (Alt)**: Degrees above horizon (0-90°)
+
+```elixir
+# Get current Az/Alt position
+{:ok, pos} = ZwoController.altaz(mount)
+IO.puts("Az: #{pos.az}°, Alt: #{pos.alt}°")
+```
 
 ### Converting Coordinates
 
@@ -128,8 +183,9 @@ Coordinates.dec_to_dms(-23.5) # → %{degrees: -23, minutes: 30, seconds: 0.0}
 | `ZwoController` | High-level convenience API |
 | `ZwoController.Mount` | GenServer-based mount controller |
 | `ZwoController.Mock` | Simulated mount for testing |
-| `ZwoController.Protocol` | Serial command definitions |
+| `ZwoController.Protocol` | Serial command definitions (includes `:AA#` for Alt-Az mode, `:AP#` for Polar mode) |
 | `ZwoController.Coordinates` | Coordinate conversion utilities |
+| `ZwoController.SatelliteTracker` | Satellite tracking with TLE propagation |
 
 ## Low-Level Access
 
