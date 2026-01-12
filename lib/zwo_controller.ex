@@ -582,13 +582,31 @@ defmodule ZwoController do
   @doc """
   Start actively tracking a satellite with the mount.
 
-  The mount will continuously move to follow the satellite.
+  This initiates a two-phase tracking process:
+
+  1. **Slewing** (`:slewing`) - Mount rapidly moves to satellite position
+  2. **Tracking** (`:tracking`) - PID-controlled pulse corrections follow the satellite
+
+  Use `wait_for_satellite_tracking/2` to block until the mount has aligned.
+
+  ## Example
+
+      :ok = ZwoController.start_satellite_tracking(tracker)
+      :ok = ZwoController.wait_for_satellite_tracking(tracker)  # Wait for alignment
+      # Mount is now tracking - safe to take photos
   """
   @spec start_satellite_tracking(GenServer.server()) :: :ok
   defdelegate start_satellite_tracking(tracker), to: SatelliteTracker, as: :start_tracking
 
   @doc """
   Stop satellite tracking and halt mount motion.
+
+  Immediately stops all mount movement and resets the tracker to `:idle` state.
+  The tracker can be restarted with `start_satellite_tracking/1`.
+
+  ## Example
+
+      :ok = ZwoController.stop_satellite_tracking(tracker)
   """
   @spec stop_satellite_tracking(GenServer.server()) :: :ok
   defdelegate stop_satellite_tracking(tracker), to: SatelliteTracker, as: :stop_tracking
@@ -629,13 +647,39 @@ defmodule ZwoController do
   defdelegate wait_for_satellite_tracking(tracker, opts \\ []), to: SatelliteTracker, as: :wait_for_tracking
 
   @doc """
-  Check if the tracked satellite is currently visible.
+  Check if the tracked satellite is currently visible (above minimum elevation).
+
+  ## Example
+
+      if ZwoController.satellite_visible?(tracker) do
+        :ok = ZwoController.start_satellite_tracking(tracker)
+      else
+        {:ok, pass} = ZwoController.next_satellite_pass(tracker)
+        IO.puts("Next pass at \#{pass.aos}")
+      end
   """
   @spec satellite_visible?(GenServer.server()) :: boolean()
   defdelegate satellite_visible?(tracker), to: SatelliteTracker, as: :visible?
 
   @doc """
   Get the next pass information for a tracked satellite.
+
+  ## Returns
+
+      {:ok, %{
+        aos: ~U[...],            # Acquisition of signal (rise time)
+        los: ~U[...],            # Loss of signal (set time)
+        max_elevation: 45.2,     # Peak elevation in degrees
+        max_elevation_time: ~U[...],
+        duration_seconds: 600,   # Pass duration
+        aos_azimuth: 45.0,       # Rise azimuth
+        los_azimuth: 315.0       # Set azimuth
+      }}
+
+  ## Example
+
+      {:ok, pass} = ZwoController.next_satellite_pass(tracker)
+      IO.puts("Next pass: \#{pass.duration_seconds}s, max el \#{pass.max_elevation}°")
   """
   @spec next_satellite_pass(GenServer.server()) :: {:ok, map()} | {:error, term()}
   defdelegate next_satellite_pass(tracker), to: SatelliteTracker, as: :next_pass

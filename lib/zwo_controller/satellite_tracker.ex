@@ -5,28 +5,68 @@ defmodule ZwoController.SatelliteTracker do
   Uses the `space_dust` library to fetch TLEs from Celestrak, propagate
   satellite positions, and generate tracking commands for the ZWO mount.
 
-  ## Example
+  ## Complete Tracking Workflow
 
-      # Create an observer location (lat, lon, altitude_km)
-      observer = ZwoController.SatelliteTracker.observer(37.7749, -122.4194, 0.01)
+  The typical workflow for tracking a satellite is:
 
-      # Track the ISS (NORAD ID 25544)
+  1. **Create observer** - Define your ground location
+  2. **Create tracker** - Initialize with mount, satellite, and observer
+  3. **Start tracking** - Mount slews to satellite, then tracks with PID control
+  4. **Wait for tracking** - Ensure mount has aligned before taking photos
+  5. **Stop tracking** - Halt mount motion when done
+
+  ## Example: Full Tracking Session
+
+      # 1. Define observer location (San Francisco)
+      observer = ZwoController.observer(37.7749, -122.4194, 0.01)
+
+      # 2. Connect to mount and create tracker for ISS
       {:ok, mount} = ZwoController.start_mount(port: :auto)
-      {:ok, tracker} = ZwoController.SatelliteTracker.start_link(
+      {:ok, tracker} = ZwoController.track_satellite(
         mount: mount,
         norad_id: "25544",
-        observer: observer
+        observer: observer,
+        min_elevation: 10.0
       )
 
-      # Get current satellite position
-      {:ok, pos} = ZwoController.SatelliteTracker.current_position(tracker)
-      # => %{az: 180.5, el: 45.2, range_km: 500.0, visible: true}
+      # 3. Start tracking (performs initial GOTO, then PID-controlled pulses)
+      :ok = ZwoController.start_satellite_tracking(tracker)
 
-      # Start tracking (moves mount to follow satellite)
-      :ok = ZwoController.SatelliteTracker.start_tracking(tracker)
+      # 4. Wait for mount to align before taking photos
+      :ok = ZwoController.wait_for_satellite_tracking(tracker, timeout_ms: 120_000)
 
-      # Stop tracking
-      :ok = ZwoController.SatelliteTracker.stop_tracking(tracker)
+      # 5. Monitor status and position during tracking
+      {:ok, :tracking} = ZwoController.satellite_tracker_status(tracker)
+      {:ok, pos} = ZwoController.satellite_position(tracker)
+      IO.puts("Tracking at Az=\#{pos.az}° El=\#{pos.el}°")
+
+      # 6. Stop when done
+      :ok = ZwoController.stop_satellite_tracking(tracker)
+
+  ## Tracker States
+
+  The tracker has three states:
+
+  - `:idle` - Created but not tracking. Call `start_tracking/1` to begin.
+  - `:slewing` - Performing initial GOTO to satellite position. Mount is moving rapidly.
+  - `:tracking` - Actively following satellite with PID-controlled pulse corrections.
+             Safe to take photos in this state.
+
+  ## PID Controller
+
+  Once aligned, the tracker uses a PID controller for precise tracking:
+
+  - **Proportional**: Immediate response to position error
+  - **Integral**: Eliminates steady-state drift over time
+  - **Derivative**: Dampens oscillation for smooth tracking
+
+  The PID controller maintains sub-degree accuracy for slow-moving satellites.
+
+  ## Safety Features
+
+  - Mount motion is automatically stopped if the tracker process crashes
+  - Safety check prevents mount from moving below the horizon
+  - Minimum elevation threshold prevents tracking satellites too low
 
   ## Well-Known NORAD IDs
 
@@ -120,7 +160,23 @@ defmodule ZwoController.SatelliteTracker do
   @doc """
   Get the current position of the tracked satellite.
 
-  Returns azimuth, elevation, range, and visibility status.
+  Returns the satellite's current azimuth, elevation, range, and visibility.
+  Position is computed in real-time from the TLE, not cached.
+
+  ## Returns
+
+      {:ok, %{
+        az: 180.5,        # Azimuth in degrees (0-360, from North)
+        el: 45.2,         # Elevation in degrees (-90 to +90)
+        range_km: 500.0,  # Distance to satellite in kilometers
+        visible: true,    # true if above minimum elevation
+        epoch: ~U[...]    # Timestamp of the calculation
+      }}
+
+  ## Example
+
+      {:ok, pos} = ZwoController.satellite_position(tracker)
+      IO.puts("Satellite at Az=\#{Float.round(pos.az, 1)}° El=\#{Float.round(pos.el, 1)}°")
   """
   @spec current_position(GenServer.server()) :: {:ok, map()} | {:error, term()}
   def current_position(server) do
@@ -148,8 +204,31 @@ defmodule ZwoController.SatelliteTracker do
   @doc """
   Start actively tracking the satellite with the mount.
 
-  The mount will continuously move to follow the satellite's predicted position.
-  Tracking will only occur when the satellite is above the minimum elevation.
+  This initiates a two-phase tracking process:
+
+  1. **Slewing phase** (status: `:slewing`) - Mount rapidly moves to the satellite's
+     current position using pulse-based GOTO. This may take 30-120 seconds depending
+     on how far the mount needs to travel.
+
+  2. **Tracking phase** (status: `:tracking`) - Mount continuously follows the
+     satellite using PID-controlled pulse corrections. Updates occur every 500ms.
+
+  Tracking only occurs when the satellite is above the configured minimum elevation.
+  If the satellite is below minimum elevation, the tracker will wait until it rises.
+
+  ## Returns
+
+  - `:ok` - Tracking started successfully. Use `status/1` or `wait_for_tracking/2`
+    to monitor progress.
+
+  ## Example
+
+      :ok = ZwoController.start_satellite_tracking(tracker)
+
+      # Wait for slewing to complete
+      :ok = ZwoController.wait_for_satellite_tracking(tracker)
+
+      # Now in :tracking state - safe to take photos
   """
   @spec start_tracking(GenServer.server()) :: :ok
   def start_tracking(server) do
@@ -158,6 +237,19 @@ defmodule ZwoController.SatelliteTracker do
 
   @doc """
   Stop tracking and halt mount motion.
+
+  This immediately:
+  - Stops all mount movement
+  - Cancels the tracking loop
+  - Resets the PID controller state
+  - Sets status to `:idle`
+
+  The tracker can be restarted with `start_tracking/1` to resume tracking.
+
+  ## Example
+
+      :ok = ZwoController.stop_satellite_tracking(tracker)
+      {:ok, :idle} = ZwoController.satellite_tracker_status(tracker)
   """
   @spec stop_tracking(GenServer.server()) :: :ok
   def stop_tracking(server) do
@@ -224,6 +316,22 @@ defmodule ZwoController.SatelliteTracker do
 
   @doc """
   Check if the satellite is currently visible (above minimum elevation).
+
+  This is a convenience function that checks the satellite's current elevation
+  against the minimum elevation configured when the tracker was created.
+
+  ## Returns
+
+  - `true` - Satellite is above minimum elevation and can be tracked
+  - `false` - Satellite is below minimum elevation
+
+  ## Example
+
+      if ZwoController.satellite_visible?(tracker) do
+        :ok = ZwoController.start_satellite_tracking(tracker)
+      else
+        IO.puts("Waiting for satellite to rise...")
+      end
   """
   @spec visible?(GenServer.server()) :: boolean()
   def visible?(server) do
